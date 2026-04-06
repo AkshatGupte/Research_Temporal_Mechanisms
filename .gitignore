@@ -1,0 +1,11 @@
+# Ignore everything by default
+/*
+
+# Allow specific files in root
+!.gitignore
+!.gitattributes
+!model.py
+!Model_GPT.ipynb
+!TFCAM.ipynb
+!DataPreprocessing_1.ipynb
+!Plausibility_GPT.ipynb
