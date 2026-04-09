@@ -1,313 +1,297 @@
-import math
-import numpy as np
+#!/usr/bin/env python3
+"""
+CoI (Chain of Influence) Model
+
+This module implements the Chain of Influence model with DyT (Dynamic Tanh) normalization,
+which combines temporal attention and cross-feature attention to detect
+how feature A at time t affects feature B at time t+k.
+
+Key Components:
+1. DyT (Dynamic Tanh) normalization layer
+2. Multi-head self-attention for cross-feature interactions
+3. Temporal and feature-level attention mechanisms
+4. Comprehensive interpretability tools
+"""
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import DataLoader, Dataset, WeightedRandomSampler
-from sklearn.metrics import roc_auc_score, f1_score, precision_score, recall_score, classification_report
-from tqdm import tqdm
-import json
-import os
-from typing import Dict, List, Tuple, Optional
+import math
+import numpy as np
 
 
 class DyT(nn.Module):
     """
-    Dynamic Tanh normalization.
-    """
-    def __init__(self, num_features: int, alpha_init: float = 1.0,
-                 beta_init: float = 1.0, gamma_init: float = 0.0):
-        super().__init__()
-        self.alpha = nn.Parameter(torch.ones(num_features) * alpha_init)
-        self.beta = nn.Parameter(torch.ones(num_features) * beta_init)
-        self.gamma = nn.Parameter(torch.ones(num_features) * gamma_init)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.alpha * torch.tanh(self.beta * x + self.gamma)
+    Dynamic Tanh (DyT) normalization layer.
     
-class PositionalEncoding(nn.Module):
-    def __init__(self, d_model: int, max_len: int = 100, dropout: float = 0.1):
-        super().__init__()
-        self.dropout = nn.Dropout(p=dropout)
-
-        pe = torch.zeros(max_len, d_model)
-        position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
-        div_term = torch.exp(
-            torch.arange(0, d_model, 2).float() * (-math.log(10000.0) / d_model)
-        )
-
-        pe[:, 0::2] = torch.sin(position * div_term)
-        pe[:, 1::2] = torch.cos(position * div_term)
-        pe = pe.unsqueeze(0)  # (1, max_len, d_model)
-        self.register_buffer("pe", pe)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = x + self.pe[:, :x.size(1)]
-        return self.dropout(x)
-
-
-
-class DyTTransformerEncoderLayer(nn.Module):
+    This layer applies a learnable tanh transformation with dynamic scaling
+    and shifting parameters, providing adaptive normalization capabilities.
     """
-    Transformer encoder layer using DyT instead of LayerNorm.
-    Returns per-head attention weights when requested.
-    """
-    def __init__(self, d_model: int, nhead: int, dim_feedforward: int = 2048,
-                 dropout: float = 0.1, activation: str = "relu"):
-        super().__init__()
-        self.self_attn = nn.MultiheadAttention(
-            d_model, nhead, dropout=dropout, batch_first=True
-        )
+    def __init__(self, num_features, alpha_init_value=0.8):
+        super(DyT, self).__init__()
+        self.alpha = nn.Parameter(torch.ones(1) * alpha_init_value)
+        self.weight = nn.Parameter(torch.ones(num_features))
+        self.bias = nn.Parameter(torch.zeros(num_features))
 
-        self.linear1 = nn.Linear(d_model, dim_feedforward)
-        self.linear2 = nn.Linear(dim_feedforward, d_model)
+    def forward(self, x):
+        # Apply the dynamic tanh function element-wise
+        x = torch.tanh(self.alpha * x)
+        return x * self.weight + self.bias
 
-        self.norm1 = DyT(d_model, alpha_init=0.8)
-        self.norm2 = DyT(d_model, alpha_init=0.8)
 
+class MultiHeadSelfAttention(nn.Module):
+    """Multi-head self-attention module for cross-feature interactions"""
+    
+    def __init__(self, emb_dim, num_heads, dropout=0.1):
+        super(MultiHeadSelfAttention, self).__init__()
+        assert emb_dim % num_heads == 0, "emb_dim must be divisible by num_heads"
+        self.emb_dim = emb_dim
+        self.num_heads = num_heads
+        self.head_dim = emb_dim // num_heads
+        
+        self.q_proj = nn.Linear(emb_dim, emb_dim)
+        self.k_proj = nn.Linear(emb_dim, emb_dim)
+        self.v_proj = nn.Linear(emb_dim, emb_dim)
         self.dropout = nn.Dropout(dropout)
-        self.dropout1 = nn.Dropout(dropout)
-        self.dropout2 = nn.Dropout(dropout)
+        self.out_proj = nn.Linear(emb_dim, emb_dim)
+        
+    # In MultiHeadSelfAttention.forward
+    def forward(self, x, mask=None):
+        batch_size, seq_len, _ = x.size()
+        q = self.q_proj(x).view(batch_size, seq_len, self.num_heads, self.head_dim)
+        k = self.k_proj(x).view(batch_size, seq_len, self.num_heads, self.head_dim)
+        v = self.v_proj(x).view(batch_size, seq_len, self.num_heads, self.head_dim)
 
-        self.activation = F.relu if activation == "relu" else F.gelu
+        q = q.transpose(1, 2)  # (batch, num_heads, seq_len, head_dim)
+        k = k.transpose(1, 2)
+        v = v.transpose(1, 2)
 
-    def forward(
-        self,
-        src: torch.Tensor,
-        src_mask: Optional[torch.Tensor] = None,
-        src_key_padding_mask: Optional[torch.Tensor] = None,
-        return_attention: bool = False
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-        attn_output, attn_weights = self.self_attn(
-            src, src, src,
-            attn_mask=src_mask,
-            key_padding_mask=src_key_padding_mask,
-            need_weights=return_attention,
-            average_attn_weights=False,   # IMPORTANT: keep per-head weights
-        )
+        scores = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(self.head_dim)
 
-        src = src + self.dropout1(attn_output)
-        src = self.norm1(src)
+        # Apply mask: mask shape (batch, seq_len) -> (batch, 1, 1, seq_len) for broadcasting
+        if mask is not None:
+            # mask: (batch, seq_len), 1 = keep, 0 = mask
+            mask = mask.unsqueeze(1).unsqueeze(2)  # (batch, 1, 1, seq_len)
+            scores = scores.masked_fill(mask == 0, float('-inf'))
 
-        ff_output = self.linear2(self.dropout(self.activation(self.linear1(src))))
-        src = src + self.dropout2(ff_output)
-        src = self.norm2(src)
+        attn_weights = F.softmax(scores, dim=-1)
+        attn_weights = self.dropout(attn_weights)
+        context = torch.matmul(attn_weights, v)
+        context = context.transpose(1, 2).contiguous().view(batch_size, seq_len, self.emb_dim)
+        output = self.out_proj(context)
+        return output, attn_weights
 
-        if return_attention:
-            return src, attn_weights  # (B, heads, T, T)
-        return src, None
-
-
-
-class ChainOfInfluence(nn.Module):
+class CrossFeatureAttention(nn.Module):
     """
-    Binary mortality classifier with:
-    - input projection
-    - positional encoding
-    - dual BiLSTM branches for temporal and feature attention
-    - DyT Transformer encoder stack
-    - single-logit classifier head
+    Module for capturing dependencies between different features across time.
+    Uses DyT normalization instead of LayerNorm for adaptive normalization.
     """
-    def __init__(
-        self,
-        n_features: int,
-        d_model: int = 64,
-        lstm_hidden: int = 32,
-        n_heads: int = 4,
-        n_layers: int = 2,
-        dim_feedforward: int = 256,
-        dropout: float = 0.2,
-        max_len: int = 48,
-        use_mask_as_padding: bool = False,   # set True only if mask means true padding
-    ):
-        super().__init__()
-
-        self.d_model = d_model
-        self.n_features = n_features
-        self.max_len = max_len
-        self.use_mask_as_padding = use_mask_as_padding
-
-        self.input_proj = nn.Linear(n_features, d_model)
-        self.pos_enc = PositionalEncoding(d_model, max_len=max_len, dropout=dropout)
-
-        self.temporal_lstm = nn.LSTM(
-            input_size=d_model,
-            hidden_size=lstm_hidden,
-            batch_first=True,
-            bidirectional=True
-        )
-        self.feature_lstm = nn.LSTM(
-            input_size=d_model,
-            hidden_size=lstm_hidden,
-            batch_first=True,
-            bidirectional=True
-        )
-
-        self.temporal_attn_proj = nn.Linear(2 * lstm_hidden, 1)      # alpha
-        self.feature_attn_proj = nn.Linear(2 * lstm_hidden, d_model)  # beta
-
-        self.transformer_layers = nn.ModuleList([
-            DyTTransformerEncoderLayer(
-                d_model=d_model,
-                nhead=n_heads,
-                dim_feedforward=dim_feedforward,
-                dropout=dropout
-            )
-            for _ in range(n_layers)
-        ])
-
-        self.classifier = nn.Sequential(
-            nn.Linear(d_model, d_model // 2),
+    
+    def __init__(self, emb_dim, num_heads, dropout=0.1):
+        super(CrossFeatureAttention, self).__init__()
+        self.self_attention = MultiHeadSelfAttention(emb_dim, num_heads, dropout)
+        # Replace LayerNorm with DyT
+        self.norm1 = DyT(emb_dim)
+        self.norm2 = DyT(emb_dim)
+        self.dropout = nn.Dropout(dropout)
+        
+        self.ff = nn.Sequential(
+            nn.Linear(emb_dim, 4 * emb_dim),
             nn.ReLU(),
             nn.Dropout(dropout),
-            nn.Linear(d_model // 2, 1)  # single logit
+            nn.Linear(4 * emb_dim, emb_dim)
         )
+        
+    # In CrossFeatureAttention.forward
+    def forward(self, x, mask=None):
+        attn_out, attn_weights = self.self_attention(x, mask)
+        x = self.norm1(x + self.dropout(attn_out))
+        ff_out = self.ff(x)
+        x = self.norm2(x + self.dropout(ff_out))
+        return x, attn_weights
 
-    def forward(
-        self,
-        x: torch.Tensor,
-        mask: Optional[torch.Tensor] = None,
-        return_attentions: bool = False
-    ) -> Tuple[torch.Tensor, Optional[Dict]]:
+
+class CoI(nn.Module):
+    """
+    Chain of Influence (CoI) Model
+    
+    A model combining temporal attention and cross-feature attention,
+    designed to detect how feature A at time t affects feature B at time t+k.
+    
+    Key Features:
+    - Temporal attention for visit-level importance
+    - Feature-level attention for variable importance
+    - Cross-feature transformer layers for complex interactions
+    - DyT normalization for adaptive scaling
+    - Comprehensive interpretability tools
+    """
+    
+    def __init__(self, input_dim, emb_dim, hidden_dim, num_heads, num_layers, 
+                 output_dim=1, dropout=0.2, max_seq_len=50):
+        super(CoI, self).__init__()
+        
+        self.input_dim = input_dim
+        self.emb_dim = emb_dim
+        self.hidden_dim = hidden_dim
+        self.output_dim = output_dim
+        self.num_heads = num_heads
+        self.num_layers = num_layers
+        
+        # Embedding layer
+        self.embedding = nn.Linear(input_dim, emb_dim)
+        
+        # Temporal attention
+        self.temporal_lstm = nn.LSTM(
+            emb_dim, hidden_dim, batch_first=True, bidirectional=True
+        )
+        self.temporal_attn = nn.Linear(hidden_dim * 2, 1)
+        
+        # Feature-level attention
+        self.feature_lstm = nn.LSTM(
+            emb_dim, hidden_dim, batch_first=True, bidirectional=True
+        )
+        self.feature_attn = nn.Linear(hidden_dim * 2, emb_dim)
+        
+        # Cross-feature transformer layers
+        self.cross_attn_layers = nn.ModuleList([
+            CrossFeatureAttention(emb_dim, num_heads, dropout)
+            for _ in range(num_layers)
+        ])
+        
+        # Output projection
+        self.output_proj = nn.Sequential(
+            nn.Linear(emb_dim, emb_dim // 2),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(emb_dim // 2, output_dim)
+        )
+        
+        # Positional encoding
+        self.register_buffer(
+            "pos_encoding", 
+            self._get_positional_encoding(max_seq_len, emb_dim)
+        )
+        
+        # Dropout for regularization
+        self.dropout = nn.Dropout(dropout)
+        
+        # Store attention weights for interpretability
+        self.temporal_weights = None
+        self.feature_weights = None
+        self.cross_attn_weights = []
+        
+    def _get_positional_encoding(self, max_seq_len, emb_dim):
+        """Generate positional encoding for transformer"""
+        pe = torch.zeros(max_seq_len, emb_dim)
+        position = torch.arange(0, max_seq_len, dtype=torch.float).unsqueeze(1)
+        div_term = torch.exp(torch.arange(0, emb_dim, 2).float() * (-math.log(10000.0) / emb_dim))
+        
+        pe[:, 0::2] = torch.sin(position * div_term)
+        pe[:, 1::2] = torch.cos(position * div_term)
+        
+        return pe.unsqueeze(0)
+        
+    def forward(self, x, mask=None):
         """
-        x:    (B, T, F)
-        mask: (B, T) boolean, True = real/valid timestep
-              If your mask is NOT true padding, leave use_mask_as_padding=False.
-        """
-        B, T, _ = x.shape
-
-        # Input projection + position encoding
-        emb = self.input_proj(x)      # (B, T, d_model)
-        emb = self.pos_enc(emb)
-
-        # LSTM branches on full sequence
-        temporal_out, _ = self.temporal_lstm(emb)  # (B, T, 2*lstm_hidden)
-        feat_out, _ = self.feature_lstm(emb)       # (B, T, 2*lstm_hidden)
-
-        # Attention weights
-        alpha = torch.sigmoid(self.temporal_attn_proj(temporal_out))  # (B, T, 1)
-        beta = torch.sigmoid(self.feature_attn_proj(feat_out))        # (B, T, d_model)
-
-        # If mask is true padding, you can suppress padded positions here.
-        # For forward-filled irregular ICU windows, usually keep this False.
-        if mask is not None and self.use_mask_as_padding:
-            m = mask.unsqueeze(-1).float()  # (B, T, 1)
-            alpha = alpha * m
-            beta = beta * m
-
-        weighted_emb = emb * beta  # (B, T, d_model)
-
-        # Transformer
-        key_padding_mask = None
-        if mask is not None and self.use_mask_as_padding:
-            key_padding_mask = ~mask.bool()  # True = padded positions
-
-        transformer_attentions = [] if return_attentions else None
-        z = weighted_emb
-        for layer in self.transformer_layers:
-            z, attn = layer(
-                z,
-                src_key_padding_mask=key_padding_mask,
-                return_attention=return_attentions
-            )
-            if return_attentions and attn is not None:
-                transformer_attentions.append(attn)
-
-        # Temporal attention weighting
-        z = z * alpha.expand(-1, -1, self.d_model)
+        Forward pass of CoI model.
+        
+        Args:
+            x: Input tensor of shape [batch_size, seq_len, input_dim]
             
-        # Global pooling
-        if mask is not None:
-            w = mask.unsqueeze(-1).float()
-            pooled = (z * w).sum(dim=1) / w.sum(dim=1).clamp_min(1.0)
-        else:
-            pooled = z.mean(dim=1)
-
-        logits = self.classifier(pooled).squeeze(-1)  # (B,)
-
-        if return_attentions:
-            info = {
-                "alpha": alpha,                         # (B, T, 1)
-                "beta": beta,                           # (B, T, d_model)
-                "transformer_attentions": transformer_attentions,
-                "embedding_weight": self.input_proj.weight,  # (d_model, n_features)
-                "input": x,
-                "mask": mask,
-            }
-            return logits, info
-
-        return logits, None
-
-    def get_local_contributions(self, info: Dict) -> torch.Tensor:
-        alpha = info["alpha"]                  # (B, T, 1)
-        beta = info["beta"]                    # (B, T, d_model)
-        W_emb = info["embedding_weight"]       # (d_model, n_features)
-        X = info["input"]                      # (B, T, n_features)
-        mask = info["mask"]
-
-        beta_W = torch.matmul(beta, W_emb)     # (B, T, n_features)
-        contrib = alpha * (beta_W * X)         # (B, T, n_features)
-
-        if mask is not None:
-            contrib = contrib * mask.unsqueeze(-1).float()
-
-        return contrib
-
-    def get_cross_attention_matrix(self, info: Dict) -> torch.Tensor:
-        attn_list = info["transformer_attentions"]
-        if not attn_list:
-            raise ValueError("No attention stored. Call forward(return_attentions=True).")
-
-        # Each layer: (B, heads, T, T)
-        stacked = torch.stack(attn_list, dim=0)  # (L, B, heads, T, T)
-        return stacked.mean(dim=(0, 2))          # (B, T, T)
-
-    def get_chain_of_influence(self, info: Dict) -> torch.Tensor:
-        C = self.get_local_contributions(info)    # (B, T, F)
-        A = self.get_cross_attention_matrix(info) # (B, T, T)
-
-        C1 = C.unsqueeze(-1).unsqueeze(-1)        # (B, T, F, 1, 1)
-        A2 = A.unsqueeze(2).unsqueeze(-1)         # (B, T, 1, T, 1)
-        C2 = C.unsqueeze(1).unsqueeze(2)          # (B, 1, 1, T, F)
-
-        I = C1 * A2 * C2                          # (B, T, F, T, F)
-        return I
-
-
-
-
-
-def build_training_components(
-    X_train, y_train, device,
-    d_model=64,
-    lstm_hidden=32,
-    n_heads=4,
-    n_layers=2,
-    dim_feedforward=256,
-    dropout=0.2,
-    lr=1e-4,
-    weight_decay=1e-5,
-    batch_size=128,
-):
-    n_features = X_train.shape[-1]
-
-    model = ChainOfInfluence(
-        n_features=n_features,
-        d_model=d_model,
-        lstm_hidden=lstm_hidden,
-        n_heads=n_heads,
-        n_layers=n_layers,
-        dim_feedforward=dim_feedforward,
-        dropout=dropout,
-        max_len=X_train.shape[1],
-        use_mask_as_padding=False,   # keep False for forward-filled 48h windows
-    ).to(device)
-
-    num_pos = float((y_train == 1).sum())
-    num_neg = float((y_train == 0).sum())
-    pos_weight = torch.tensor([num_neg / max(num_pos, 1.0)], device=device)
-
-    criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
-
-    return model, criterion, optimizer
+        Returns:
+            output: Prediction tensor of shape [batch_size, output_dim]
+        """
+        batch_size, seq_len, _ = x.size()
+        max_len = self.pos_encoding.size(1)
+        if seq_len > max_len:
+            raise ValueError(
+                f"Sequence length {seq_len} exceeds max_seq_len {max_len}. "
+                "Increase max_seq_len in the model config."
+            )
+        
+        # Clear previous attention weights
+        self.cross_attn_weights = []
+        
+        # Embedding
+        x = self.embedding(x)  # [batch_size, seq_len, emb_dim]
+        
+        # Add positional encoding (ensure device match)
+        pos_encoding = self.pos_encoding[:, :seq_len, :].to(x.device)
+        x = x + pos_encoding
+        
+        # Temporal attention
+        temporal_lstm_out, _ = self.temporal_lstm(x)
+        temporal_attn_weights = torch.sigmoid(self.temporal_attn(temporal_lstm_out))
+        self.temporal_weights = temporal_attn_weights
+        
+        # Feature-level attention
+        feature_lstm_out, _ = self.feature_lstm(x)
+        feature_attn_weights = torch.sigmoid(self.feature_attn(feature_lstm_out))
+        self.feature_weights = feature_attn_weights
+        
+        # Apply feature attention
+        x = x * feature_attn_weights
+        
+        # Cross-feature attention layers
+        for layer in self.cross_attn_layers:
+            x, attn_weights = layer(x, mask)
+            self.cross_attn_weights.append(attn_weights)
+        
+        # Apply temporal attention
+        x = x * temporal_attn_weights
+        
+        # Global average pooling
+        x = torch.mean(x, dim=1)  # [batch_size, emb_dim]
+        
+        # Output projection
+        output = self.output_proj(x)
+        
+        return output
+    
+    def get_attention_weights(self):
+        """
+        Get all attention weights for interpretability.
+        Returns:
+            dict: Dictionary containing temporal, feature, and cross-feature attention weights
+        """
+        return {
+            'temporal': self.temporal_weights,
+            'feature': self.feature_weights,
+            'cross_feature': self.cross_attn_weights
+        }
+    
+    def compute_contributions(self, patient_idx=0):
+        """
+        Compute feature contributions for a specific patient.
+        
+        Args:
+            patient_idx: Index of the patient in the batch
+            
+        Returns:
+            np.ndarray: Contribution matrix of shape [seq_len, input_dim]
+        """
+        if self.temporal_weights is None or self.feature_weights is None:
+            raise ValueError("Model must be run forward first to compute contributions")
+        
+        # Get attention weights for the specific patient
+        a_t = self.temporal_weights[patient_idx].squeeze(-1)  # [seq_len]
+        b_t = self.feature_weights[patient_idx]  # [seq_len, emb_dim]
+        
+        # Get embedding weights
+        W_emb = self.embedding.weight  # [emb_dim, input_dim]
+        
+        # Get the original input for this patient
+        # Note: This requires access to the original input tensor
+        # For now, we'll compute a simplified version
+        seq_len = a_t.size(0)
+        input_dim = self.input_dim
+        
+        device = a_t.device
+        contributions = torch.zeros(seq_len, input_dim, device=device)
+        
+        # Compute contributions for each time step and feature
+        for t in range(seq_len):
+            for j in range(input_dim):
+                contributions[t, j] = a_t[t] * torch.sum(b_t[t] * W_emb[:, j])
+        
+        return contributions.detach().cpu().numpy()
