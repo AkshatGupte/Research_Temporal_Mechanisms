@@ -4,8 +4,25 @@
 # Allow specific files in root
 !.gitignore
 !.gitattributes
-!model.py
 !Model_GPT.ipynb
 !TFCAM.ipynb
 !DataPreprocessing_1.ipynb
 !Plausibility_GPT.ipynb
+!tfcam.py
+!requirements.txt
+!Model_DP.ipynb
+!train_coi.py
+!Replicated.ipynb
+!enhanced_preprocessing.py
+!Faithfulness_Testing.ipynb
+
+# Allow Scripts directory, then keep only selected scripts
+!Scripts/
+Scripts/*
+!Scripts/model-gpt.py
+!Scripts/model.py
+!Scripts/train_coi.py
+!Scripts/train_tfcam.py
+!Scripts/evaluate.py
+!Scripts/faithfulness_tests.py
+!Scripts/tfcam.py
