@@ -19,12 +19,22 @@ Both models are designed to address the "black box" limitation of deep learning 
 
 | File | Description |
 |------|-------------|
-| `DataPreprocessing_1.ipynb` | Extracts raw data from BigQuery, performs outlier detection, aggregation, and initial processing for model input. |
-| `Model_GPT.ipynb` | Trains and evaluates the CoI model on preprocessed CKD data. Contains full training and testing pipeline. |
-| `Plausibility_GPT.ipynb` | Uses SHAP to check clinical plausibility of model predictions and ensure alignment with medical knowledge. |
-| `TFCAM.ipynb` | Trains and evaluates the TFCAM model on the same dataset, with interpretability analysis. |
-| `enhanced_preprocessing.py` | Advanced preprocessing pipeline (taken from the official CoI repository) for temporal-aware imputation, feature engineering, and resampling. |
-| `model.py` | PyTorch implementation of the CoI model, adapted from the official GitHub repository. |
-| `tfcam.py` | PyTorch implementation of the TFCAM model with cross-temporal attention mechanism. |
-| `train_coi.py` | Training utilities for CoI, including hyperparameter search, early stopping, and evaluation metrics. |
+| `DataPreprocessing_1.ipynb` | Extracts and preprocesses raw ICU data for downstream modeling. |
+| `Model_GPT.ipynb` | Main CoI training and evaluation notebook. |
+| `Model_DP.ipynb` | Alternate CoI experimentation notebook for data-processing variants. |
+| `Faithfulness_Testing.ipynb` | Faithfulness experiments to validate temporal attention behavior. |
+| `Plausibility_GPT.ipynb` | SHAP-based plausibility checks against clinical expectations. |
+| `TFCAM.ipynb` | TFCAM training, evaluation, and interpretability analysis. |
 | `requirements.txt` | Python dependencies for the project. |
+
+### `Scripts/`
+
+| File | Description |
+|------|-------------|
+| `Scripts/model.py` | PyTorch CoI model implementation. |
+| `Scripts/model-gpt.py` | Extended/alternate CoI implementation variant. |
+| `Scripts/tfcam.py` | PyTorch TFCAM model implementation. |
+| `Scripts/train_coi.py` | Training utilities for CoI. |
+| `Scripts/train_tfcam.py` | Training utilities for TFCAM. |
+| `Scripts/evaluate.py` | Evaluation helpers and detailed metric reporting. |
+| `Scripts/faithfulness_tests.py` | Erasure-based faithfulness testing utilities. |
